@@ -4,8 +4,11 @@
 1. #### oleobject가 삽입된 악성코드를 분석하고 의심스러운 부분에 대해서 어떻게 탐지를 진행할지 아이디어 작성하기
 2. #### oletools 내 도구를 사용하여 DDE 스크립트 추출 / 야라룰작성
 
+<br>
+
 ## 2-1. oleobject 악성코드 분석
 
+### 1) oleobj를 활용하여 분석
 - oleobject가 삽입된 3개의 악성 워드파일을 추출하여 파일 구조를 확인하였다.
 
     ![Alt text](image.png)
@@ -21,7 +24,149 @@
   
   ![Alt text](image-6.png)
 
+<br>
 
+### 2) 파일 내용 분석
+- olebrowse툴로 파일의 내용을 확인해보았다. (txt파일로 열어도 된다.)
+  
+  ![Alt text](image-8.png)
+
+  ![Alt text](image-9.png)
+
+  ![Alt text](image-10.png)
+
+  세 악성 문서 파일 모두에서 url이 포함된 파일을 발견했다.
+  
+  (위에 OCX라는 이름이 많이 보여서 알아보니 OCX(Ole Control eXtention)는 ActiveX 컨트롤로 알려져있는데,
+  웹 브라우저 내에서 특정 동작을 수행하는 ActiveX 컨트롤을 사용할 수 있다고한다.)
+
+  아마도 url을 통해 악성 행위를 실행시키는 것으로 예상된다.
+
+  그래서 파일들의 내용을 텍스트로 뽑아 url이 있을경우 악성으로 판단하도록 진행하면 될 것 같다.
+
+<br>
+
+### 3) 파일의 내용을 전부 텍스트로 추출
+- 위의 내용에서 알 수 있듯이 url사이가 null값으로 매워져 있었기 때문에 텍스트로 출력 불가능한 문자는 제외하도록 하였다.
+  
+  ```python
+  # doc 파일의 내부 파일들의 내용을 텍스트로 추출하는 프로그램
+  # docx는 XML 포맷이기 때문에 다루지 않음
+
+  import olefile
+  import os
+  import re
+
+  def extract_text_from_ole_doc(file_path, output_dir):    
+  if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+  base_name = os.path.splitext(os.path.basename(file_path))[0]
+  output_txt_file_path = os.path.join(output_dir, base_name + ".txt")
+
+  with olefile.OleFileIO(file_path) as ole:
+        all_entries = [entry for entry in ole.listdir()]
+
+        with open(output_txt_file_path, 'w', encoding='utf-8') as output_file:
+              for entry in all_entries:
+              if ole.exists('/'.join(entry)):
+                    stream = ole.openstream(entry)
+                    content = stream.read().decode('utf-8', errors='ignore')
+                    content_clean = re.sub(r'[\x00-\x1F\x7F-\xFF]', '', content) # 텍스트로 출력 불가능한 문자는 지움
+                    output_file.write(content_clean + '\n')
+
+  print(f"{output_txt_file_path}")
+
+  def process_directory(input_dir, output_dir):
+  for filename in os.listdir(input_dir):
+        file_path = os.path.join(input_dir, filename)
+        if os.path.isfile(file_path) and file_path.endswith('.doc'):
+              extract_text_from_ole_doc(file_path, output_dir)
+
+
+  input_dir = './malole'
+  output_dir = './malole/script'
+  process_directory(input_dir, output_dir)
+
+  ```
+  <br>
+  실행 결과 다음과 같이 파일의 내용이 텍스트로 잘 추출되었다.
+
+  ![Alt text](image-11.png)
+
+  다음 Yara-rule을 이용해 url을 탐지하도록 하면 될 것 같다.
+
+<br>
+
+### 4) Yara-rule 작성 및 rule 기반 탐지
+
+- url 패턴을 탐지하기 위해서 url의 프로토콜 부분을 매칭하도록 rule을 작성하였다.
+  ```javascript
+  // protocol로 url을 탐지하는 rule
+  rule detect_url
+  {
+    meta:
+      description = "Detect url in olefiles"
+      author = "WHS 방범대"
+      date = "2023-12-20"
+    strings: 
+      $http = "http://" nocase 
+      $https = "https://" nocase
+      $ftp = "ftp://" nocase
+      $ftps = "ftps://" nocase
+      $ssh = "ssh://" nocase
+      $telnet = "telnet://" nocase
+      $smtp = "smtp://" nocase
+      $pop3 = "pop3://" nocase
+      $imap = "imap://" nocase
+      $sftp = "sftp://" nocase
+      $dns = "dns://" nocase
+      $rtp = "rtp://" nocase
+      $ldap = "ldap://" nocase
+      $rtsp = "rtsp://" nocase
+      $sip = "sip://" nocase
+
+  condition:  
+   any of ($http, $https, $ftp, $ftps, $ssh, $telnet, $smtp, $pop3, $imap, $sftp, $dns, $rtp, $ldap, $rtsp, $sip)
+  }
+
+
+- 작성한 rule을 실행하기 위해 python 코드를 작성하였다.
+
+  ```python
+  # url.yara 기반 악성 워드파일을 탐지하는 코드
+  import yara
+  import os
+
+  dir_path = "./malole/script"
+  rules = yara.compile(filepath="./url.yara")
+
+  malicious, total = 0, 0
+
+  for filename in os.listdir(dir_path):
+      file_path = os.path.join(dir_path, filename)
+      if os.path.isfile(file_path):
+          with open(file_path, 'rb') as f:
+              matches = rules.match(data=f.read())
+              if matches:
+                  malicious += 1
+                  print(f"{file_path} | [Malicious]")
+              else:
+                  print(f"{file_path}")
+
+  print(f"Total: {total}")
+  print(f"Malicious: {malicious}")
+  ```
+
+- 실행결과는 다음과 같다.
+  
+  ![Alt text](image-12.png)
+
+  일단 3개의 악성파일을 탐지하는 데는 성공했다.
+  
+  후에 일반 파일도 추가해서 검증 할 예정이다.
+
+<br>
 
 - ### [+] oleobj 툴을 디렉터리 단위로 실행시키기 위한 파이썬 코드.
   
@@ -49,7 +194,7 @@
     ```
 
 
-
+<br>
 
 ## 2-2. DDE 문서 분석
 
